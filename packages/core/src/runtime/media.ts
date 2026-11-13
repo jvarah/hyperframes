@@ -16,6 +16,7 @@ import { ownsPausedVideoTime } from "./pausedVideoFrames";
 import { isRenderFrameVideo } from "./preloadMedia.js";
 import { registerSeekCompletion } from "./adapters/seek-dispatch.js";
 import { cutToHostSlots, type HostSlot } from "../mediaTiming.js";
+import { isAudibleVideoElement } from "../audibleVideo.js";
 import {
   forgetSteering,
   markMediaRestarted,
@@ -406,8 +407,61 @@ const OUT_POINT_WATCH_SECONDS = 0.5;
 const outPointWatch = new WeakMap<HTMLMediaElement, number>();
 const heldAtOutPoint = new WeakMap<HTMLMediaElement, number>();
 const lastFrameBefore = new WeakMap<HTMLMediaElement, { outPoint: number; at: number }>();
+// A heard video split from one file plays on to this short of its out-point: pausing on the last frame before it
+// cuts up to two frames of sound from the join. Chrome may then show the out-point's frame, the next clip's first.
+const HEARD_OUT_POINT_MARGIN_SECONDS = 0.006;
+const outPointPause = new WeakMap<HTMLMediaElement, ReturnType<typeof wallSetTimeout>>();
 const reportsFrames = (el: HTMLMediaElement): el is HTMLVideoElement =>
   typeof (el as HTMLVideoElement).requestVideoFrameCallback === "function";
+
+function holdAtOutPoint(el: HTMLMediaElement, outPoint: number): void {
+  outPointWatch.delete(el);
+  heldAtOutPoint.set(el, outPoint);
+  heldAhead.add(el);
+  el.pause();
+}
+
+function pauseShortOfOutPoint(el: HTMLMediaElement, outPoint: number): void {
+  outPointPause.delete(el);
+  if (outPointWatch.get(el) !== outPoint) return;
+  if (el.paused) {
+    outPointWatch.delete(el);
+    return;
+  }
+  const left = (outPoint - HEARD_OUT_POINT_MARGIN_SECONDS - el.currentTime) / el.playbackRate;
+  if (left > 0.001)
+    outPointPause.set(
+      el,
+      wallSetTimeout(() => pauseShortOfOutPoint(el, outPoint), left * 1000),
+    );
+  else holdAtOutPoint(el, outPoint);
+}
+
+/** The next clip plays the same file on from this clip's out-point: a split, whose sound has no gap at the join. */
+function continuesIntoNextClip(
+  clip: RuntimeMediaClip,
+  clips: RuntimeMediaClip[],
+  outPoint: number,
+): boolean {
+  const src = clip.el.currentSrc || clip.el.src;
+  return (
+    src !== "" &&
+    clips.some(
+      (next) =>
+        next !== clip &&
+        (next.el.currentSrc || next.el.src) === src &&
+        sameInstant(next.start, clip.end) &&
+        sameInstant(mediaSourceTimeAt(next, next.start), outPoint),
+    )
+  );
+}
+
+/** Times the pause of a heard video from its clock, so it stops just short of the out-point. */
+function pauseAtOutPointBySound(el: HTMLMediaElement, outPoint: number): void {
+  if (outPointWatch.get(el) === outPoint) return;
+  outPointWatch.set(el, outPoint);
+  pauseShortOfOutPoint(el, outPoint);
+}
 
 function watchOutPoint(el: HTMLVideoElement, outPoint: number): void {
   if (outPointWatch.get(el) === outPoint) return;
@@ -434,22 +488,27 @@ function watchOutPoint(el: HTMLVideoElement, outPoint: number): void {
       el.requestVideoFrameCallback(onFrame);
       return;
     }
-    outPointWatch.delete(el);
-    heldAtOutPoint.set(el, outPoint);
-    heldAhead.add(el);
-    el.pause();
+    holdAtOutPoint(el, outPoint);
   };
   el.requestVideoFrameCallback(onFrame);
 }
 
 function forgetOutPoint(el: HTMLMediaElement): void {
+  wallClearTimeout(outPointPause.get(el));
+  outPointPause.delete(el);
   outPointWatch.delete(el);
   heldAtOutPoint.delete(el);
   lastFrameBefore.delete(el);
 }
 
 /** Where a watched video is held: on the last frame before its out-point once its cadence is known. */
-function outPointHoldTime(el: HTMLMediaElement, outPoint: number, watched: boolean): number {
+function outPointHoldTime(
+  el: HTMLMediaElement,
+  outPoint: number,
+  watched: boolean,
+  soundsToOutPoint: boolean,
+): number {
+  if (soundsToOutPoint) return outPoint - HEARD_OUT_POINT_MARGIN_SECONDS;
   if (!watched) return outPoint - MEDIA_SYNC_TOLERANCE_SECONDS;
   const last = lastFrameBefore.get(el);
   return last?.outPoint === outPoint ? last.at : outPoint;
@@ -552,8 +611,15 @@ export function syncRuntimeMedia(params: {
     const isNonLoopVideo = el.tagName === "VIDEO" && !clip.loop;
     const inWindow = isInClipWindow(params.timeSeconds, clip.start, clip.end);
     const dueIn = clip.start - params.timeSeconds;
+    // A video whose own element is the sound keeps to the audio rules at its edges, or a cut gaps its sound.
+    const heard =
+      el.tagName === "VIDEO" &&
+      isAudibleVideoElement(el) &&
+      !el.muted &&
+      !forceMuteAll &&
+      params.isWebAudioOwned?.(el) !== true;
     const cueAhead =
-      el.tagName === "AUDIO"
+      el.tagName === "AUDIO" || heard
         ? (params.cueAheadSeconds ?? 0)
         : params.playing && videoStartLatency !== null
           ? videoStartLatency * params.playbackRate + (params.cueAheadSeconds ?? 0) / 2
@@ -756,13 +822,15 @@ export function syncRuntimeMedia(params: {
       if (el.tagName === "VIDEO" && !isHeldVideoTail) {
         const outPoint = mediaSourceTimeAt(clip, clip.end);
         const watched = reportsFrames(el);
-        if (
-          watched &&
-          playing &&
-          !clip.loop &&
-          !el.paused &&
-          outPoint - currentElTime <= OUT_POINT_WATCH_SECONDS * baseRate
-        )
+        const nearOutPoint = (within: number) =>
+          playing && !clip.loop && !el.paused && outPoint - currentElTime <= within * baseRate;
+        const soundsToOutPoint =
+          heard &&
+          outPoint - currentElTime <= OUT_POINT_WATCH_SECONDS * baseRate &&
+          continuesIntoNextClip(clip, params.clips, outPoint);
+        if (soundsToOutPoint && nearOutPoint(VIDEO_LEAD_HOLD_SECONDS))
+          pauseAtOutPointBySound(el, outPoint);
+        else if (!soundsToOutPoint && watched && nearOutPoint(OUT_POINT_WATCH_SECONDS))
           watchOutPoint(el, outPoint);
         const atOutPoint = heldAtOutPoint.get(el) === outPoint;
         // A loop's playhead wraps before its element, so its offset jumps by a lap: steering owns loops.
@@ -770,7 +838,7 @@ export function syncRuntimeMedia(params: {
           !clip.loop &&
           (offset < -VIDEO_LEAD_HOLD_SECONDS ||
             atOutPoint ||
-            currentElTime >= outPointHoldTime(el, outPoint, watched));
+            currentElTime >= outPointHoldTime(el, outPoint, watched, soundsToOutPoint));
         if (!playing || (!ahead && offset >= -MEDIA_SYNC_TOLERANCE_SECONDS)) heldAhead.delete(el);
         else if (ahead && (!el.paused || atOutPoint)) {
           heldAhead.add(el);
@@ -808,7 +876,9 @@ export function syncRuntimeMedia(params: {
       }
       const forceSync = !isPlayingMedia && !holdingAhead && params.forceSync && drift > 0.02;
       const steered =
-        isPlayingMedia && !hardSync ? steerMedia(el, offset, baseRate, offsetStabilized) : null;
+        isPlayingMedia && !hardSync
+          ? steerMedia(el, offset, baseRate, offsetStabilized, el.tagName === "AUDIO" || heard)
+          : null;
       const steerSeeks = steered?.seek === true;
       const dipped = steerSeeks && params.seekUnderDip?.(el, relTime) === true;
       try {
@@ -892,7 +962,7 @@ export function syncRuntimeMedia(params: {
         // the element waiting for a callback that never came.
         markPlayRequested(el);
         markMediaRestarted(el);
-        if (isNonLoopVideo)
+        if (isNonLoopVideo && !heard)
           videoStarts.set(el, {
             weight: startWeight,
             offset: relTime - (el.currentTime || 0),

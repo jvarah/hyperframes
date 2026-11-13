@@ -1015,7 +1015,7 @@ describe("syncRuntimeMedia", () => {
       expect(clip.el.play).not.toHaveBeenCalled();
     });
 
-    it("starts nothing early while paused, and never a video", () => {
+    it("starts nothing early while paused, and never a muted video", () => {
       const audio = createMockClip({ start: 5, end: 6 }, "audio");
       syncRuntimeMedia({
         clips: [audio],
@@ -1025,6 +1025,7 @@ describe("syncRuntimeMedia", () => {
         cueAheadSeconds: 0.017,
       });
       const video = createMockClip({ start: 5, end: 6 }, "video");
+      video.el.muted = true;
       syncRuntimeMedia({
         clips: [video],
         timeSeconds: 4.99,
@@ -2282,6 +2283,33 @@ describe("syncRuntimeMedia", () => {
         getCompositionDuration: () => 30,
       });
 
+    // Plays `clip` at `playAt`, then has its element `lag` s behind the playhead at `sampleAt`.
+    const startWithLag = (
+      clip: RuntimeMediaClip,
+      playAt: number,
+      sampleAt: number,
+      lag: number,
+      playheadRunning = true,
+    ) => {
+      if (playheadRunning)
+        syncRuntimeMedia({
+          clips: [],
+          timeSeconds: playAt,
+          playing: true,
+          playbackRate: 1,
+          getCompositionDuration: () => 30,
+        });
+      tick(clip, playAt);
+      expect(clip.el.play).toHaveBeenCalledTimes(1);
+      Object.defineProperty(clip.el, "paused", {
+        value: false,
+        writable: true,
+        configurable: true,
+      });
+      clip.el.currentTime = clip.mediaStart + (sampleAt - clip.start) - lag;
+      tick(clip, sampleAt);
+    };
+
     it("does not start a video while the playhead is held", () => {
       const clip = videoClip({ start: 0, end: 10 });
       tick(clip, 0, false);
@@ -2414,33 +2442,6 @@ describe("syncRuntimeMedia", () => {
     describe("start latency", () => {
       afterEach(() => resetVideoStartLatency());
 
-      // Plays `clip` at `playAt`, then has its element `lag` s behind the playhead at `sampleAt`.
-      const startWithLag = (
-        clip: RuntimeMediaClip,
-        playAt: number,
-        sampleAt: number,
-        lag: number,
-        playheadRunning = true,
-      ) => {
-        if (playheadRunning)
-          syncRuntimeMedia({
-            clips: [],
-            timeSeconds: playAt,
-            playing: true,
-            playbackRate: 1,
-            getCompositionDuration: () => 30,
-          });
-        tick(clip, playAt);
-        expect(clip.el.play).toHaveBeenCalledTimes(1);
-        Object.defineProperty(clip.el, "paused", {
-          value: false,
-          writable: true,
-          configurable: true,
-        });
-        clip.el.currentTime = clip.mediaStart + (sampleAt - clip.start) - lag;
-        tick(clip, sampleAt);
-      };
-
       it("does not start an upcoming video early before any start is measured", () => {
         const clip = videoClip({ start: 10, end: 20, mediaStart: 0 });
         tick(clip, 9.99);
@@ -2528,6 +2529,194 @@ describe("syncRuntimeMedia", () => {
         expect(due50ms.el.play).toHaveBeenCalledTimes(1);
       });
     });
+
+    describe("a video whose sound is heard", () => {
+      afterEach(() => {
+        resetVideoStartLatency();
+        vi.useRealTimers();
+      });
+
+      // An audible video playing its own sound, with no rate change, and frames reported where asked.
+      const heardVideo = (overrides: Partial<RuntimeMediaClip> = {}) => {
+        const clip = videoClip({ start: 0, end: 10, mediaStart: 0, ...overrides });
+        const el = clip.el as HTMLVideoElement;
+        el.muted = false;
+        el.src = "/take.mp4";
+        el.setAttribute("data-has-audio", "true");
+        Object.defineProperty(el, "paused", { value: false, writable: true, configurable: true });
+        el.pause = vi.fn(() =>
+          Object.defineProperty(el, "paused", { value: true, writable: true, configurable: true }),
+        );
+        return { clip, el };
+      };
+      // Ticks `clip` with its second half: the same file played on from its out-point at 10 s.
+      const secondHalves = new WeakMap<RuntimeMediaClip, RuntimeMediaClip>();
+      const splitTick = (clip: RuntimeMediaClip, timeSeconds: number, userMuted = false) => {
+        const secondHalf =
+          secondHalves.get(clip) ?? heardVideo({ start: 10, end: 20, mediaStart: 10 }).clip;
+        secondHalves.set(clip, secondHalf);
+        syncRuntimeMedia({
+          clips: [clip, secondHalf],
+          timeSeconds,
+          playing: true,
+          playbackRate: 1,
+          userMuted,
+          getCompositionDuration: () => 30,
+        });
+      };
+      const reportFrames = (el: HTMLVideoElement) => {
+        const pending: VideoFrameRequestCallback[] = [];
+        el.requestVideoFrameCallback = vi.fn((callback: VideoFrameRequestCallback) => {
+          pending.push(callback);
+          return pending.length;
+        });
+        return (mediaTime: number) => {
+          el.currentTime = mediaTime;
+          const frame = { mediaTime } as VideoFrameCallbackMetadata;
+          pending.splice(0).forEach((callback) => callback(0, frame));
+        };
+      };
+
+      it("plays on past the last frame before its out-point, to just short of it", () => {
+        vi.useFakeTimers();
+        const { clip, el } = heardVideo();
+        const present = reportFrames(el);
+        el.currentTime = 9.6;
+        splitTick(clip, 9.6);
+        present(9.875);
+        present(9.9167); // a dropped frame: a muted take would be held here
+        present(9.9583);
+        el.currentTime = 9.94;
+        splitTick(clip, 9.94);
+        expect(el.pause).not.toHaveBeenCalled();
+        el.currentTime = 9.994; // its clock when the scheduled pause is due
+        vi.advanceTimersByTime(53);
+        expect(el.pause).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(1);
+        expect(el.pause).toHaveBeenCalledTimes(1);
+        splitTick(clip, 9.995);
+        expect(el.play).not.toHaveBeenCalled();
+      });
+
+      it("times the pause from its own clock where no frames are reported", () => {
+        vi.useFakeTimers();
+        const { clip, el } = heardVideo();
+        el.currentTime = 9.97; // a muted take is held here, a sync tolerance short of the out-point
+        splitTick(clip, 9.965);
+        expect(el.pause).not.toHaveBeenCalled();
+        el.currentTime = 9.985; // it ran slower than asked: the pause waits for its clock
+        vi.advanceTimersByTime(24);
+        expect(el.pause).not.toHaveBeenCalled();
+        el.currentTime = 9.994;
+        vi.advanceTimersByTime(9);
+        expect(el.pause).toHaveBeenCalledTimes(1);
+      });
+
+      it("is held by the tick once it is within the margin of its out-point", () => {
+        const { clip, el } = heardVideo();
+        el.currentTime = 9.995;
+        splitTick(clip, 9.99);
+        expect(el.pause).toHaveBeenCalledTimes(1);
+      });
+
+      it("drops a scheduled out-point pause when a seek takes the playhead back", () => {
+        vi.useFakeTimers();
+        const { clip, el } = heardVideo();
+        el.currentTime = 9.94;
+        splitTick(clip, 9.94);
+        splitTick(clip, 2);
+        expect(el.currentTime).toBe(mediaElementTime(2));
+        const pausedBySeek = vi.mocked(el.pause).mock.calls.length;
+        Object.defineProperty(el, "paused", { value: false, writable: true, configurable: true });
+        el.currentTime = 9.994;
+        vi.advanceTimersByTime(100);
+        expect(el.pause).toHaveBeenCalledTimes(pausedBySeek);
+      });
+
+      it("keeps the picture hold while the output is muted", () => {
+        const { clip, el } = heardVideo();
+        const present = reportFrames(el);
+        el.currentTime = 9.6;
+        splitTick(clip, 9.6, true);
+        present(9.9167);
+        present(9.9583);
+        expect(el.pause).toHaveBeenCalledTimes(1);
+      });
+
+      it.each([
+        ["other footage", null],
+        ["a later part of the same file", 12],
+      ])("keeps the picture hold at a cut to %s", (_cut, nextMediaStart) => {
+        const { clip, el } = heardVideo();
+        const present = reportFrames(el);
+        const clips =
+          nextMediaStart === null
+            ? [clip]
+            : [clip, heardVideo({ start: 10, end: 20, mediaStart: nextMediaStart }).clip];
+        el.currentTime = 9.6;
+        syncRuntimeMedia({
+          clips,
+          timeSeconds: 9.6,
+          playing: true,
+          playbackRate: 1,
+          getCompositionDuration: () => 30,
+        });
+        present(9.9167);
+        present(9.9583); // the next frame, at 10, is the out-point's
+        expect(el.pause).toHaveBeenCalledTimes(1);
+      });
+
+      it("starts one tick early, like audio, not by the learned video start delay", () => {
+        startWithLag(videoClip({ start: 0, end: 10, mediaStart: 0 }), 0, 0.3, 0.06);
+        const due = (timeSeconds: number) => {
+          const { clip, el } = heardVideo({ start: 10, end: 20 });
+          Object.defineProperty(el, "paused", { value: true, writable: true, configurable: true });
+          syncRuntimeMedia({
+            clips: [clip],
+            timeSeconds,
+            playing: true,
+            playbackRate: 1,
+            cueAheadSeconds: 0.016,
+            getCompositionDuration: () => 30,
+          });
+          return el;
+        };
+        expect(due(9.95).play).not.toHaveBeenCalled();
+        expect(due(9.99).play).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not teach the video start delay", () => {
+        const { clip, el } = heardVideo();
+        Object.defineProperty(el, "paused", { value: true, writable: true, configurable: true });
+        startWithLag(clip, 0, 0.3, 0.06);
+        const muted = videoClip({ start: 10, end: 20, mediaStart: 0 });
+        tick(muted, 9.95);
+        expect(muted.el.play).not.toHaveBeenCalled();
+      });
+
+      it("is steered like audio: at most 10% fast, then seeked under a dip", () => {
+        const { clip, el } = heardVideo({ end: 20 });
+        const seekUnderDip = vi.fn(() => true);
+        const steerTick = (timeSeconds: number) =>
+          syncRuntimeMedia({
+            clips: [clip],
+            timeSeconds,
+            playing: true,
+            playbackRate: 1,
+            seekUnderDip,
+            getCompositionDuration: () => 30,
+          });
+        el.currentTime = 4.6;
+        steerTick(5);
+        steerTick(5.02);
+        expect(el.playbackRate).toBeCloseTo(1.1, 9);
+        expect(seekUnderDip).not.toHaveBeenCalled();
+        el.currentTime = 4.89;
+        steerTick(5.02);
+        steerTick(5.02);
+        expect(seekUnderDip).toHaveBeenCalledWith(el, 5.02);
+      });
+    });
   });
 
   describe("playing media drift", () => {
@@ -2540,6 +2729,8 @@ describe("syncRuntimeMedia", () => {
       Object.defineProperty(clip.el, "paused", { value: false, writable: true });
       Object.defineProperty(clip.el, "currentTime", { value: currentTime, writable: true });
       clip.el.playbackRate = playbackRate;
+      // A video's own sound is steered like audio (below); these are muted takes.
+      if (tag === "video") clip.el.muted = true;
       return clip;
     }
     const tick = (clip: RuntimeMediaClip, timeSeconds: number, playbackRate = 1) =>
@@ -2697,7 +2888,7 @@ describe("syncRuntimeMedia", () => {
         expect(clip.el.currentTime).toBe(mediaElementTime(5));
       });
 
-      it("leaves video on its steps", () => {
+      it("leaves a muted video on its steps", () => {
         const clip = playingVideoAt(4.85);
         tickDipping(clip, 5, true);
         const seekUnderDip = tickDipping(clip, 5, true);
