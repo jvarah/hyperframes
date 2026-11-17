@@ -126,6 +126,24 @@ describe("runtime entry", () => {
     }
   });
 
+  // #7986: a re-init calls the old run's teardown, which must take its blur filters off the page.
+  it("tears motion blur down with the runtime", async () => {
+    const teardown = vi.fn();
+    vi.doMock("./captureMotionBlur", async (original) => ({
+      ...(await original<typeof import("./captureMotionBlur")>()),
+      teardownCaptureMotionBlur: teardown,
+    }));
+    try {
+      mountRoot().appendChild(document.createElement("div"));
+      await evaluateRuntime();
+      expect(teardown).not.toHaveBeenCalled();
+      window.__hfRuntimeTeardown?.();
+      expect(teardown).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.doUnmock("./captureMotionBlur");
+    }
+  });
+
   it("drives an async frame source without a GSAP timeline and waits before capture", async () => {
     const root = mountRoot();
     root.setAttribute("data-duration", "10");

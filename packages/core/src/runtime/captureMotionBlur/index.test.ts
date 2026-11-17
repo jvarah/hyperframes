@@ -12,6 +12,7 @@ import {
   resetCaptureMotionBlurForTests,
   setFilterFallbackForTests,
   setMotionBlurPreviewQuality,
+  teardownCaptureMotionBlur,
   trackAcceleratedCanvases,
 } from ".";
 
@@ -1263,6 +1264,30 @@ describe("painting", () => {
     expect(win.__hf_page_composite_pending).toBe(false);
   });
 
+  it("on teardown hands the engine's composite hook back to its prior owner", () => {
+    installHtmlInCanvas();
+    const prior = vi.fn(() => true);
+    win.__hf_page_composite_resolve = prior;
+    const { h } = movingHost();
+    initCaptureMotionBlur(h);
+    void paintCaptureMotionBlur(0.5, { engineMode: true });
+    expect(win.__hf_page_composite_resolve).not.toBe(prior);
+    teardownCaptureMotionBlur();
+    expect(win.__hf_page_composite_resolve).toBe(prior);
+    expect(win.__hfMotionBlur).toBeUndefined();
+  });
+
+  it("on teardown keeps a composite hook installed over its own", () => {
+    installHtmlInCanvas();
+    const { h } = movingHost();
+    initCaptureMotionBlur(h);
+    void paintCaptureMotionBlur(0.5, { engineMode: true });
+    const later = vi.fn(() => true);
+    win.__hf_page_composite_resolve = later;
+    teardownCaptureMotionBlur();
+    expect(win.__hf_page_composite_resolve).toBe(later);
+  });
+
   it("re-scans for movers when the runtime binds a different timeline", () => {
     installHtmlInCanvas();
     let timeline = "first";
@@ -1976,6 +2001,32 @@ describe("filter fallback", () => {
     expect(document.querySelectorAll("feOffset")).toHaveLength(32);
     expect(document.querySelectorAll("feComposite")).toHaveLength(31);
     expect(document.querySelectorAll("feGaussianBlur")).toHaveLength(1);
+  });
+
+  // #7986: a re-init can load a fresh runtime copy, whose filter ids start again at hf-mb-0.
+  it("leaves no filter behind on teardown, so a fresh runtime's hf-mb-0 is the only one", async () => {
+    const first = movingHost(CAPTURE);
+    initCaptureMotionBlur(first.h);
+    void paintCaptureMotionBlur(0.5, PLAY);
+    expect(document.querySelectorAll('[id="hf-mb-0"]')).toHaveLength(1);
+    teardownCaptureMotionBlur();
+    expect(document.querySelectorAll("svg")).toHaveLength(0);
+    expect(first.el.style.filter).toBe("");
+    expect(win.__hfMotionBlur).toBeUndefined();
+    first.root.remove();
+
+    vi.resetModules();
+    const fresh = await import(".");
+    try {
+      const second = movingHost(CAPTURE);
+      fresh.initCaptureMotionBlur(second.h);
+      void fresh.paintCaptureMotionBlur(0.5, PLAY);
+      expect(document.querySelectorAll('[id="hf-mb-0"]')).toHaveLength(1);
+      expect(second.el.style.filter).toMatch(/url\("?#hf-mb-0"?\)/);
+      expect(win.__hfMotionBlur?.report()).toMatchObject({ state: "on", tier: "filter" });
+    } finally {
+      fresh.resetCaptureMotionBlurForTests();
+    }
   });
 
   it("draws fewer copies in preview below Full, and the full 32 in a render", () => {

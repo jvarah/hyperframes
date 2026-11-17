@@ -826,16 +826,33 @@ function suspendCaptureMotionBlur(): void {
   instance?.suspend();
 }
 
-/** Test-only: drop module state between cases. */
-export function resetCaptureMotionBlurForTests(): void {
+/**
+ * Undo this run's blur on the page for `__hfRuntimeTeardown`. A re-init may load a fresh copy of
+ * the runtime whose module state starts empty and reuses the `hf-mb-N` filter ids, so a filter
+ * `<svg>` left behind here shadows the new one and moving elements render blank (#7986).
+ */
+export function teardownCaptureMotionBlur(): void {
+  const w = window as CompositeWindow;
   instance?.teardown();
   instance = null;
   activeHost = null;
   activeConfig = null;
   onFallback = false;
-  suspended = false;
+  // Hand the engine's composite hook back only while ours is on top; a later installer chained
+  // over us keeps calling it, and with no instance it does nothing.
+  if (ourResolver && w.__hf_page_composite_resolve === ourResolver) {
+    if (priorResolver) w.__hf_page_composite_resolve = priorResolver;
+    else delete w.__hf_page_composite_resolve;
+  }
   priorResolver = null;
   ourResolver = null;
+  delete w.__hfMotionBlur;
+}
+
+/** Test-only: drop module state between cases. */
+export function resetCaptureMotionBlurForTests(): void {
+  teardownCaptureMotionBlur();
+  suspended = false;
   setFilterPreviewQuality(1);
 }
 

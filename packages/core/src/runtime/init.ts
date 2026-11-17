@@ -194,6 +194,7 @@ import {
   paintCaptureMotionBlur,
   releaseCaptureMotionBlurFrame,
   setMotionBlurPreviewQuality,
+  teardownCaptureMotionBlur,
 } from "./captureMotionBlur";
 import { TransportClock } from "./clock";
 import { WebAudioTransport } from "./webAudioTransport";
@@ -4964,6 +4965,7 @@ export function initSandboxRuntimeModular(): void {
   // Per-pixel effect chains: compile once here, repaint on every seek below.
   initVfx(document.body, state.canonicalFps);
   initMotionBlur();
+  registerRuntimeCleanup(teardownCaptureMotionBlur);
   registerRuntimeCleanup(
     watchSceneWebglContexts(() => {
       rebuildLostVfx(document.body);
